@@ -1,0 +1,7 @@
+streamlit
+openai
+python-docx
+python-dotenv
+watchdog
+pytz
+pandas

@@ -1,0 +1,30 @@
+{
+    "Modules": {
+        "General": {
+            "tasks": [
+                {
+                    "id": "98f603f7-abd4-4806-ac72-6e714d0045ce",
+                    "title": "Prepare for Business Law Test and Group Work",
+                    "details": "Prepare for the test on contracts in Business Law, scheduled for tomorrow. Also, attend the group work on Innovation & Entrepreneurship today at 5 p.m.",
+                    "date": "2025-11-25",
+                    "created_at": 1764041894.977138
+                }
+            ],
+            "knowledge": [],
+            "events": []
+        },
+        "Business Law": {
+            "tasks": [
+                {
+                    "id": "7c9a2897-909a-439b-909c-292102745c2b",
+                    "title": "Prepare for Business Law Test",
+                    "details": "Prepare for the test on contracts in Business Law, scheduled for tomorrow.",
+                    "date": "2025-11-26",
+                    "created_at": 1764041839.229318
+                }
+            ],
+            "knowledge": [],
+            "events": []
+        }
+    }
+}

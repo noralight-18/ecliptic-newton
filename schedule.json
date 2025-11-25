@@ -1,0 +1,20 @@
+{
+    "Monday": {
+        "08:50-11:35": "Innovation & Entrepreneurship [IB417]",
+        "15:30-17:05": "Doing Business in China [IB505]",
+        "18:20-21:05": "Strategic Management [IB405]"
+    },
+    "Tuesday": {
+        "13:30-15:05": "Intensive Chinese (101) [IB434]"
+    },
+    "Wednesday": {
+        "08:50-11:35": "Introduction to Corporate Finance [IB447]"
+    },
+    "Thursday": {
+        "08:50-11:35": "International Investment Analysis [IB417]",
+        "13:30-15:05": "Intensive Chinese (101) [IB313]"
+    },
+    "Friday": {
+        "08:50-11:35": "Business Law [IB517]"
+    }
+}
