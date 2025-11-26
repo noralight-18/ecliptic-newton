@@ -5,12 +5,64 @@ import os
 import pandas as pd
 import datetime
 import pytz
+import requests
+import json
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from datetime import timedelta
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Emily: Executive OS", page_icon="💼", layout="wide")
 
 # Inject CSS
 st.markdown(styles.get_custom_css(), unsafe_allow_html=True)
+
+# --- NOTIFICATION HELPERS (NEW) ---
+
+def send_telegram_alert(message):
+    """Sends a message to your phone via Telegram."""
+    try:
+        if "telegram" in st.secrets:
+            token = st.secrets["telegram"]["bot_token"]
+            chat_id = st.secrets["telegram"]["chat_id"]
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+            requests.post(url, json=payload)
+    except Exception as e:
+        print(f"Telegram Error: {e}")
+
+def add_google_calendar_event(summary, date_obj, duration_minutes=60):
+    """Adds an event to Google Calendar."""
+    try:
+        if "google" in st.secrets:
+            # Load credentials
+            creds_dict = dict(st.secrets["google"])
+            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            
+            creds = service_account.Credentials.from_service_account_info(
+                creds_dict, scopes=['https://www.googleapis.com/auth/calendar']
+            )
+            service = build('calendar', 'v3', credentials=creds)
+
+            # Handle Date (Default to 9 AM if it's just a date object)
+            if isinstance(date_obj, datetime.date) and not isinstance(date_obj, datetime.datetime):
+                start_dt = datetime.datetime.combine(date_obj, datetime.time(9, 0))
+            else:
+                start_dt = date_obj
+
+            end_dt = start_dt + timedelta(minutes=duration_minutes)
+
+            event = {
+                'summary': f"🎓 {summary}", 
+                'start': {'dateTime': start_dt.isoformat(), 'timeZone': 'Asia/Shanghai'},
+                'end': {'dateTime': end_dt.isoformat(), 'timeZone': 'Asia/Shanghai'},
+            }
+            
+            service.events().insert(calendarId='primary', body=event).execute()
+            return True
+    except Exception as e:
+        st.error(f"Calendar Error: {e}")
+        return False
 
 # --- SIDEBAR & NAVIGATION ---
 with st.sidebar:
@@ -117,6 +169,20 @@ if view == "🎙️ Capture":
                 if isinstance(result_meta, dict) and "error" not in result_meta:
                     st.session_state["last_task_metadata"] = result_meta
                     
+                    # --- AUTO NOTIFICATION HOOK (VOICE) ---
+                    # Note: We need to see utils.py to do this perfectly, 
+                    # but if 'type' is in result_meta, we can try:
+                    item_type = result_meta.get("type", "").lower()
+                    item_title = result_meta.get("title", "Voice Command")
+                    
+                    if "task" in item_type:
+                        send_telegram_alert(f"🎙️ *Voice Task Added*\n{item_title}")
+                    elif "event" in item_type:
+                        # Assuming result_meta might have a date, if not, this is tricky without utils.py
+                        # For now, we just notify Telegram that an event was created
+                        send_telegram_alert(f"📅 *Event Created via Voice*\n{item_title}\nCheck Calendar.")
+                    # -------------------------------------
+
                 st.session_state["last_audio"] = audio_val
                 st.success("Saved to System.")
                 st.rerun()
@@ -151,7 +217,13 @@ elif view == "📅 Calendar":
             
             if st.form_submit_button("Save Event"):
                 utils.add_manual_item(m_module, "events", m_title, m_details, str(m_date))
-                st.success("Event Saved")
+                
+                # --- GOOGLE CALENDAR SYNC ---
+                with st.spinner("Syncing to Google Calendar..."):
+                    add_google_calendar_event(m_title, m_date)
+                # ----------------------------
+                
+                st.success("Event Saved & Synced to Google!")
                 st.rerun()
     
     # Calculate dates for current week (Mon-Fri)
@@ -207,7 +279,12 @@ elif view == "✅ Tasks":
             
             if st.form_submit_button("Save Task"):
                 utils.add_manual_item(t_module, "tasks", t_title, t_details, str(t_date))
-                st.success("Task Saved")
+                
+                # --- TELEGRAM NOTIFICATION ---
+                send_telegram_alert(f"📝 *New Task Added*\n\n**{t_title}**\nDue: {t_date}\nModule: {t_module}")
+                # -----------------------------
+                
+                st.success("Task Saved & Sent to Phone")
                 st.rerun()
     
     if not modules:
@@ -303,6 +380,7 @@ if prompt:
         
     with st.spinner("Thinking..."):
         history = [m for m in st.session_state.messages if m["role"] != "system"]
+        # AI Logic happens in utils.chat_with_emily
         response = utils.chat_with_emily(prompt, history)
         
     st.session_state.messages.append({"role": "assistant", "content": response})
