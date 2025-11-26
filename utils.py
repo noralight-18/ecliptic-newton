@@ -10,8 +10,7 @@ from openai import OpenAI
 
 # --- CONFIGURATION ---
 DATA_FILE = "data.json"
-# ⚠️ IMPORTANT: Change this to your actual Timezone (e.g., 'America/New_York', 'Europe/Paris')
-# If this is wrong, your reminders will be at the wrong time!
+# We keep this as Shanghai (Beijing Time) as you requested
 USER_TIMEZONE = 'Asia/Shanghai' 
 BEIJING_TZ = pytz.timezone(USER_TIMEZONE)
 
@@ -33,7 +32,8 @@ def load_data():
 def save_data(data):
     with open(DATA_FILE, "w") as f: json.dump(data, f, indent=4)
 
-def get_current_time_str():
+# --- TIME HELPERS (FIXED NAME HERE) ---
+def get_beijing_time_str():
     return datetime.datetime.now(BEIJING_TZ).strftime("%H:%M")
 
 def get_current_date_str():
@@ -166,7 +166,7 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
         "title": result.get("title"),
         "details": result.get("details"),
         "date": result.get("date", get_current_date_str()),
-        "created_at": get_current_time_str()
+        "created_at": get_beijing_time_str()
     }
     if item_type == "event": item["time"] = result.get("time", "09:00")
         
@@ -204,18 +204,12 @@ def chat_with_emily(user_message, history):
             return f"✅ **Done.** Added **{res.get('title')}** to your tasks."
         
     # --- FIXED FALLBACK PERSONA ---
-    # Now she knows she has tools!
     system_persona = """
     You are Emily, a proactive Executive OS connected to the user's Google Calendar and Task Board.
     
     CAPABILITIES:
     - You CAN schedule reminders (by adding them to Google Calendar).
     - You CAN create tasks (by adding them to the app).
-    
-    IF THE USER COMPLAINS about not getting a reminder:
-    1. Explain that you push reminders to their Google Calendar.
-    2. Ask them to check if their "Google Calendar Notifications" are turned on.
-    3. Remind them to check the Timezone setting in the code if the time was wrong.
     """
     msgs = [{"role":"system","content":system_persona}] + history + [{"role":"user","content":user_message}]
     return client.chat.completions.create(model="gpt-4o", messages=msgs).choices[0].message.content
