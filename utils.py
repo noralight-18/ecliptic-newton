@@ -2,7 +2,6 @@ import streamlit as st
 import json
 import os
 import datetime
-import time
 import pytz
 import requests
 from google.oauth2 import service_account
@@ -14,11 +13,9 @@ DATA_FILE = "data.json"
 BEIJING_TZ = pytz.timezone('Asia/Shanghai')
 
 def get_openai_client():
-    # Try multiple ways to find the key to prevent crashes
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key and "OPENAI_API_KEY" in st.secrets:
         api_key = st.secrets["OPENAI_API_KEY"]
-    
     if api_key:
         return OpenAI(api_key=api_key)
     return None
@@ -41,29 +38,20 @@ def get_current_date_str():
 
 # --- INTELLIGENT NOTIFICATIONS ---
 
-def send_telegram_alert(message, delay_minutes=0):
+def send_telegram_alert(message):
+    """Sends an IMMEDIATE message to Telegram."""
     try:
         if "telegram" in st.secrets:
             token = st.secrets["telegram"]["bot_token"]
             chat_id = st.secrets["telegram"]["chat_id"]
-            
-            payload = {
-                "chat_id": chat_id, 
-                "text": message, 
-                "parse_mode": "Markdown"
-            }
-            
-            # DELAY LOGIC
-            if delay_minutes > 0:
-                future_time = int(time.time() + (delay_minutes * 60))
-                payload["schedule_date"] = future_time
-            
             url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
             requests.post(url, json=payload)
     except Exception as e:
         print(f"Telegram Failed: {e}")
 
-def add_google_calendar_event(summary, start_iso, duration_minutes=60):
+def add_google_calendar_event(summary, start_iso, duration_minutes=30):
+    """Adds event to Google Calendar (This works as the Reminder)"""
     try:
         if "google" in st.secrets:
             creds_dict = dict(st.secrets["google"])
@@ -73,13 +61,20 @@ def add_google_calendar_event(summary, start_iso, duration_minutes=60):
             )
             service = build('calendar', 'v3', credentials=creds)
             
+            # Create Time Objects
             start_dt = datetime.datetime.fromisoformat(start_iso)
             end_dt = start_dt + datetime.timedelta(minutes=duration_minutes)
             
             event = {
-                'summary': f"🎓 {summary}", 
+                'summary': f"⏰ {summary}",  # Add Alarm Clock Emoji
                 'start': {'dateTime': start_dt.isoformat(), 'timeZone': 'Asia/Shanghai'},
                 'end': {'dateTime': end_dt.isoformat(), 'timeZone': 'Asia/Shanghai'},
+                'reminders': {
+                    'useDefault': False,
+                    'overrides': [
+                        {'method': 'popup', 'minutes': 0}, # Notify at exact time
+                    ],
+                },
             }
             service.events().insert(calendarId='primary', body=event).execute()
             return True
@@ -97,31 +92,27 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
     if not client: return {"error": "API Key Missing"}
 
     data = load_data()
-    
-    # SYSTEM PROMPT: Calculates Delays & Categories
     current_time_str = datetime.datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
     
+    # SYSTEM PROMPT: Simpler Logic
     system_prompt = f"""
     You are Emily, an intelligent Executive OS.
     Current System Time (Beijing): {current_time_str}
     
-    YOUR GOAL: Classify the user's input and extract structured data.
-
-    CATEGORIES:
-    1. REMINDER (Telegram): User wants an alert at a specific time (e.g., "Remind me in 20 mins", "Alert me at 10pm").
-    2. EVENT (Calendar): User has a meeting, class, or fixed schedule.
-    3. TASK (To-Do): Homework, buying items, general to-dos.
-    4. NOTE: General info to save.
+    YOUR GOAL: Classify input.
+    
+    CRITICAL RULE: 
+    - If the user specifies a TIME (e.g. "at 10pm", "in 1 hour"), it MUST be an EVENT/REMINDER (Calendar).
+    - If the user specifies NO TIME (e.g. "Buy milk"), it is a TASK (Telegram).
 
     OUTPUT JSON ONLY:
     {{
-        "type": "task" | "event" | "note" | "reminder",
-        "module": "Subject (Business Law, Strategy) or 'General'",
-        "title": "Short, clear title",
+        "type": "task" | "event" | "note",
+        "module": "Subject or 'General'",
+        "title": "Short title",
         "details": "Full context",
         "date": "YYYY-MM-DD",
-        "time": "HH:MM" (24h format),
-        "delay_minutes": 0 (INTEGER. Calculate this! If it's 9:00 and user says 9:30, delay is 30. If user says 'in 1 hour', delay is 60.)
+        "time": "HH:MM" (24h format. If user says '10pm', output '22:00'. If user says 'in 1 hour' and now is 14:00, output '15:00'.)
     }}
     """
     
@@ -138,18 +129,16 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
     except Exception as e:
         return {"error": str(e)}
 
-    # Map to DB Keys
-    type_map = {"task": "tasks", "event": "events", "note": "knowledge", "reminder": "tasks"}
-    db_key = type_map.get(result.get("type"), "knowledge")
+    # Logic: Reminders are now treated as Events so they go to Calendar
+    item_type = result.get("type")
+    
+    # Save to Database
+    db_key = "events" if item_type == "event" else "tasks" if item_type == "task" else "knowledge"
     target_mod = result.get("module", manual_module)
     
-    # Safety: Create module/list if missing
-    if target_mod not in data["Modules"]:
-        data["Modules"][target_mod] = {"tasks": [], "events": [], "knowledge": []}
-    if db_key not in data["Modules"][target_mod]:
-        data["Modules"][target_mod][db_key] = []
+    if target_mod not in data["Modules"]: data["Modules"][target_mod] = {"tasks": [], "events": [], "knowledge": []}
+    if db_key not in data["Modules"][target_mod]: data["Modules"][target_mod][db_key] = []
 
-    # Save Item
     item = {
         "id": len(data["Modules"][target_mod][db_key]) + 1,
         "title": result.get("title", "Untitled"),
@@ -157,26 +146,25 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
         "date": result.get("date", get_current_date_str()),
         "created_at": get_beijing_time_str()
     }
+    if item_type == "event":
+        item["time"] = result.get("time", "09:00")
+        
     data["Modules"][target_mod][db_key].append(item)
     save_data(data)
     
-    # EXECUTE ACTION
-    delay = result.get("delay_minutes", 0)
+    # --- ROUTING LOGIC ---
     
-    if result.get("type") == "reminder":
-        # Specific Logic for Reminders
-        msg = f"⏰ *Reminder*\n\n{result.get('title')}"
-        send_telegram_alert(msg, delay_minutes=delay)
-        
-    elif result.get("type") == "task":
-        # Immediate Task Notification
-        msg = f"⚡ *New Task*\n\n{result.get('title')}\nDue: {result.get('date')}"
-        send_telegram_alert(msg)
-        
-    elif result.get("type") == "event":
-        # Calendar Sync
+    # 1. TIME-BASED (Calendar)
+    if item_type == "event":
         iso = f"{result.get('date')}T{result.get('time','09:00')}:00"
-        add_google_calendar_event(result.get('title'), iso)
+        success = add_google_calendar_event(result.get('title'), iso)
+        if success:
+            # We send a Telegram just to confirm we did it, but the REMINDER is in the Calendar
+            send_telegram_alert(f"🗓️ *Scheduled*\n\nI've added **{result.get('title')}** to your Calendar for {result.get('time')}.")
+            
+    # 2. IMMEDIATE (Telegram)
+    elif item_type == "task":
+        send_telegram_alert(f"⚡ *New Task*\n\n{result.get('title')}\nDue: {result.get('date')}")
         
     return result
 
@@ -184,52 +172,26 @@ def chat_with_emily(user_message, history):
     client = get_openai_client()
     if not client: return "⚠️ API Key Missing."
 
-    # 1. ROUTER: Decide if this is a command
-    # Improved Prompt: Explicitly mentions "reminder" and asks for simple yes/no
-    check_prompt = """
-    Analyze the user input. Is the user asking to:
-    - Create a task?
-    - Schedule an event?
-    - Set a reminder?
-    - Save a note?
-    
-    Answer with one word: YES or NO.
-    """
-    
+    check_prompt = "Is user asking to create a task, event, reminder, or note? Answer YES or NO."
     check = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role":"system","content":check_prompt}, {"role":"user","content":user_message}]
+        model="gpt-4o", messages=[{"role":"system","content":check_prompt}, {"role":"user","content":user_message}]
     )
     
-    # 2. LOGIC: Case-insensitive check (The fix!)
-    decision = check.choices[0].message.content.strip().upper()
-    
-    if "YES" in decision:
+    if "YES" in check.choices[0].message.content.upper():
         res = process_assistant_input(user_message)
-        if "error" in res:
-            return f"❌ Error: {res['error']}"
-            
-        if res.get("delay_minutes", 0) > 0:
-            return f"✅ Done. I've set a reminder for **{res['delay_minutes']} minutes** from now on your phone."
-        elif res.get("type") == "event":
-            return f"✅ Done. Scheduled **{res.get('title')}** on Google Calendar."
-        else:
-            return f"✅ Done. Added **{res.get('title')}** to your system."
+        if "error" in res: return f"❌ Error: {res['error']}"
         
-    # 3. FALLBACK: Normal Chat
-    # We explicitly tell her she has tools so she doesn't deny her abilities.
-    system_persona = """
-    You are Emily, a proactive Executive OS.
-    You have access to the user's Google Calendar and Telegram for reminders.
-    If the user asks for a reminder and you ended up here, apologize and say you might have missed the trigger, but you CAN do it if they phrase it clearly.
-    Keep answers concise and professional.
-    """
-    msgs = [{"role":"system","content":system_persona}] + history + [{"role":"user","content":user_message}]
+        if res.get("type") == "event":
+            return f"✅ Done. I've scheduled **{res.get('title')}** on your Google Calendar at {res.get('time')}."
+        else:
+            return f"✅ Done. Added **{res.get('title')}** to your tasks."
+        
+    msgs = [{"role":"system","content":"You are Emily. Concise answers."}] + history + [{"role":"user","content":user_message}]
     return client.chat.completions.create(model="gpt-4o", messages=msgs).choices[0].message.content
 
 # Mocks
-def analyze_image(f, m="General"): return "Image Analysis Placeholder"
-def analyze_speech_coach(t): return {"grade": "B", "pacing_score": 7, "filler_count": 0, "critique": "Good."}
+def analyze_image(f, m="General"): return "Analysis Placeholder"
+def analyze_speech_coach(t): return {"grade": "B", "critique": "Good."}
 def delete_item(m, t, i): pass
 def add_manual_item(m, t, ti, d, da): pass
 def get_all_classes(): return ["Business Law", "Strategy"]
