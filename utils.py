@@ -24,7 +24,10 @@ def load_data():
     if not os.path.exists(DATA_FILE):
         return {"Modules": {}}
     with open(DATA_FILE, "r") as f:
-        return json.load(f)
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {"Modules": {}}
 
 def save_data(data):
     with open(DATA_FILE, "w") as f:
@@ -37,24 +40,20 @@ def get_beijing_time_str():
     return datetime.datetime.now(BEIJING_TZ).strftime("%H:%M")
 
 def get_current_context():
-    # Simple hardcoded context for now (e.g., checks time to guess class)
     hour = datetime.datetime.now(BEIJING_TZ).hour
     if 9 <= hour < 12: return "In Class: Strategy"
     if 12 <= hour < 14: return "Lunch Break"
     return "Free Time / Study"
 
 def get_current_module():
-    # Logic to guess module based on day/time could go here
     return "General"
 
 def get_all_classes():
-    # Load from a schedule.json if you have one, or return defaults
     return ["Business Law", "Strategic Management", "Marketing", "Finance"]
 
 # --- AUTOMATION: NOTIFICATIONS ---
 
 def send_telegram_alert(message):
-    """Buzzes your phone via Telegram."""
     try:
         if "telegram" in st.secrets:
             token = st.secrets["telegram"]["bot_token"]
@@ -66,7 +65,6 @@ def send_telegram_alert(message):
         print(f"Telegram Failed: {e}")
 
 def add_google_calendar_event(summary, start_iso, duration_minutes=60):
-    """Pushes event to Google Calendar."""
     try:
         if "google" in st.secrets:
             creds_dict = dict(st.secrets["google"])
@@ -106,79 +104,83 @@ def transcribe_audio(audio_file, for_coach=False):
     return transcript
 
 def process_assistant_input(user_text, manual_module="General", last_task_metadata=None):
-    """
-    Decides if it's a Task or Event, Updates DB, and Sends Notification automatically.
-    """
     client = get_openai_client()
     data = load_data()
     
     current_time = datetime.datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
     
-    # 1. THE DECISION PROMPT
     system_prompt = f"""
-    You are Emily, an Executive OS for a college student.
-    Current Time (Beijing): {current_time}
+    You are Emily, an Executive OS.
+    Current Time: {current_time}
     
     DECISION LOGIC:
-    1. EVENT (Google Calendar): If the input involves meeting people, classes, or specific time-bound attendance.
-    2. TASK (Telegram): If the input is individual work, assignments, or to-dos with a deadline.
-    3. NOTE: If it's just information to remember.
+    1. EVENT (Google Calendar): Meeting people, classes, specific time.
+    2. TASK (Telegram): Individual work, assignments, deadlines.
+    3. NOTE: Info to remember.
 
     OUTPUT JSON ONLY:
     {{
         "type": "task" | "event" | "note",
-        "module": "Subject name (e.g. Business Law) or 'General'",
+        "module": "Subject or 'General'",
         "title": "Short summary",
         "details": "Full details",
-        "date": "YYYY-MM-DD" (Target date),
-        "time": "HH:MM" (Start time, 24h format. Default 09:00 if missing),
-        "duration_mins": 60 (For events)
+        "date": "YYYY-MM-DD",
+        "time": "HH:MM" (24h, Default 09:00),
+        "duration_mins": 60
     }}
     """
     
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Context Module: {manual_module}. Input: {user_text}"}
-        ],
-        response_format={"type": "json_object"}
-    )
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Context: {manual_module}. Input: {user_text}"}
+            ],
+            response_format={"type": "json_object"}
+        )
+        result = json.loads(response.choices[0].message.content)
+    except Exception as e:
+        return {"error": str(e)}
     
-    result = json.loads(response.choices[0].message.content)
+    # --- FIX IS HERE: Correctly map the types to database keys ---
+    type_map = {
+        "task": "tasks",
+        "event": "events",
+        "note": "knowledge"  # This was the missing link causing the crash
+    }
     
-    # 2. SAVE TO DATABASE
+    # Get the correct DB folder name (default to 'knowledge' if unknown)
+    db_key = type_map.get(result.get("type"), "knowledge")
+    
     target_mod = result.get("module", manual_module)
     if target_mod not in data["Modules"]:
         data["Modules"][target_mod] = {"tasks": [], "events": [], "knowledge": []}
     
-    new_id = len(data["Modules"][target_mod][result["type"] + "s"]) + 1
+    # Use the MAPPED key to calculate ID
+    new_id = len(data["Modules"][target_mod][db_key]) + 1
+    
     item_record = {
         "id": new_id,
-        "title": result["title"],
-        "details": result["details"],
-        "date": result["date"],
+        "title": result.get("title", "Untitled"),
+        "details": result.get("details", ""),
+        "date": result.get("date", get_current_date_str()),
         "created_at": current_time
     }
     
-    # Store in JSON
-    if result["type"] == "task":
-        data["Modules"][target_mod]["tasks"].append(item_record)
-    elif result["type"] == "event":
+    if result.get("type") == "event":
         item_record["time"] = result.get("time", "09:00")
-        data["Modules"][target_mod]["events"].append(item_record)
-    elif result["type"] == "note":
-         data["Modules"][target_mod]["knowledge"].append(item_record)
-         
+    
+    # Save to the correct list
+    data["Modules"][target_mod][db_key].append(item_record)
     save_data(data)
     
-    # 3. AUTOMATION TRIGGERS (The "Less Manual" Part)
-    if result["type"] == "task":
-        msg = f"⚡ *Emily Task Manager*\n\n📌 **{result['title']}**\n📅 Due: {result['date']}\n📂 {target_mod}\n\n_{result['details']}_"
+    # --- AUTOMATION TRIGGERS ---
+    if result.get("type") == "task":
+        msg = f"⚡ *Emily Task*\n\n📌 **{result['title']}**\n📅 Due: {result['date']}\n📂 {target_mod}"
         send_telegram_alert(msg)
         
-    elif result["type"] == "event":
-        # Construct ISO time for Google
+    elif result.get("type") == "event":
         iso_start = f"{result['date']}T{result.get('time', '09:00')}:00"
         add_google_calendar_event(result["title"], iso_start, result.get("duration_mins", 60))
         
@@ -187,13 +189,9 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
 # --- OMNISCIENT CHAT ---
 
 def chat_with_emily(user_message, history):
-    """
-    Handles standard chat but also listens for commands to execute.
-    """
     client = get_openai_client()
     
-    # Check if this is a command (Smart routing)
-    # We reuse the logic above if it looks like a command
+    # Check if command
     check_prompt = "Is this user asking to create a task, schedule an event, or save a note? Answer YES or NO."
     check = client.chat.completions.create(
         model="gpt-4o",
@@ -201,22 +199,18 @@ def chat_with_emily(user_message, history):
     )
     
     if "YES" in check.choices[0].message.content:
-        # Route to the processor
         res = process_assistant_input(user_message)
+        if "error" in res:
+            return "I tried to process that but encountered an error."
+            
         if res["type"] == "task":
-            return f"✅ Done. I've added **{res['title']}** to your tasks and sent it to your phone."
+            return f"✅ Done. Added task **{res['title']}** and notified your phone."
         elif res["type"] == "event":
-            return f"✅ Done. I've scheduled **{res['title']}** on your Google Calendar."
+            return f"✅ Done. Scheduled **{res['title']}** on Google Calendar."
         else:
             return f"✅ Saved note: {res['title']}"
             
-    # Otherwise, normal chat
-    system_persona = """
-    You are Emily, a witty, proactive Executive OS. 
-    Keep answers concise, visual, and helpful. 
-    You have access to the user's context.
-    """
-    
+    system_persona = "You are Emily, a witty Executive OS. Keep answers concise."
     messages = [{"role": "system", "content": system_persona}] + history + [{"role": "user", "content": user_message}]
     
     response = client.chat.completions.create(
@@ -225,38 +219,37 @@ def chat_with_emily(user_message, history):
     )
     return response.choices[0].message.content
 
-# --- VISION ---
+# --- VISION & COACH ---
 def analyze_image(image_file, manual_module="General"):
-    client = get_openai_client()
-    # In a real app, base64 encode the image. 
-    # For Streamlit simplified, we mock the vision response or use a specific library.
-    # Assuming GPT-4o vision capability here:
-    return "Image analysis requires base64 encoding implementation. (Feature Placeholder)"
+    return "Image analysis placeholder."
 
 def analyze_speech_coach(transcript):
-    # Mock logic for the coach - normally uses GPT to grade text
     client = get_openai_client()
-    prompt = f"Analyze this speech text for a presentation. Grade it (A-F), score pacing (1-10), and count fillers. JSON output. Text: {transcript}"
-    
-    response = client.chat.completions.create(
-        model="gpt-4o", 
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"}
-    )
-    return json.loads(response.choices[0].message.content)
+    prompt = f"Analyze speech. Grade (A-F), score pacing (1-10), count fillers. JSON. Text: {transcript}"
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o", 
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.choices[0].message.content)
+    except:
+        return {"grade": "N/A", "pacing_score": 0, "filler_count": 0, "critique": "Error analyzing."}
 
-# --- UTILS FOR UI ---
 def delete_item(mod, type_, id_):
     data = load_data()
-    if mod in data["Modules"]:
-        items = data["Modules"][mod].get(type_, [])
-        data["Modules"][mod][type_] = [i for i in items if i.get("id") != id_]
+    if mod in data["Modules"] and type_ in data["Modules"][mod]:
+        data["Modules"][mod][type_] = [i for i in data["Modules"][mod][type_] if i.get("id") != id_]
         save_data(data)
 
 def add_manual_item(mod, type_, title, details, date):
     data = load_data()
     if mod not in data["Modules"]:
         data["Modules"][mod] = {"tasks": [], "events": [], "knowledge": []}
+    
+    # Ensure list exists
+    if type_ not in data["Modules"][mod]:
+        data["Modules"][mod][type_] = []
         
     new_id = len(data["Modules"][mod][type_]) + 1
     item = {"id": new_id, "title": title, "details": details, "date": date}
