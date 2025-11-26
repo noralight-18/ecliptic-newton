@@ -79,4 +79,160 @@ def add_google_calendar_event(summary, start_iso, duration_minutes=60):
             
             event = {
                 'summary': f"⏰ {summary}", 
-                'start': {'dateTime': start_dt.isofo
+                'start': {'dateTime': start_dt.isoformat(), 'timeZone': USER_TIMEZONE},
+                'end': {'dateTime': end_dt.isoformat(), 'timeZone': USER_TIMEZONE},
+                'reminders': {'useDefault': False, 'overrides': [{'method': 'popup', 'minutes': 0}]}
+            }
+            service.events().insert(calendarId=target_id, body=event).execute()
+            return True
+    except Exception as e:
+        print(f"Calendar Error: {e}")
+        return False
+
+# --- MORNING BRIEFING ---
+def check_and_send_briefing():
+    data = load_data()
+    today_str = get_current_date_str()
+    last_sent = data.get("Meta", {}).get("last_briefing", "")
+    
+    if last_sent != today_str:
+        tasks = []
+        events = []
+        for mod, content in data.get("Modules", {}).items():
+            for t in content.get("tasks", []):
+                if t.get("date") == today_str: tasks.append(f"• {t['title']}")
+            for e in content.get("events", []):
+                if e.get("date") == today_str: events.append(f"• {e.get('time','?')}: {e['title']}")
+        
+        if tasks or events:
+            msg = f"🌅 **Briefing** ({today_str})\n\n📅 **Events:**\n"
+            msg += "\n".join(events) if events else "None"
+            msg += "\n\n✅ **Tasks:**\n"
+            msg += "\n".join(tasks) if tasks else "None"
+            
+            send_telegram_alert(msg)
+            
+            if "Meta" not in data: data["Meta"] = {}
+            data["Meta"]["last_briefing"] = today_str
+            save_data(data)
+
+# --- AI BRAIN ---
+def transcribe_audio(audio_file, for_coach=False):
+    client = get_openai_client()
+    if not client: return "⚠️ API Key Missing"
+    return client.audio.transcriptions.create(model="whisper-1", file=audio_file, response_format="text")
+
+def process_assistant_input(user_text, manual_module="General", last_task_metadata=None):
+    client = get_openai_client()
+    if not client: return {"error": "API Key Missing"}
+    data = load_data()
+    
+    # We use double braces {{ }} to escape them in f-strings
+    system_prompt = f"""
+    You are Emily. Current Time: {datetime.datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")}
+    LOGIC:
+    1. TIME specified ("at 2pm") -> EVENT (Calendar).
+    2. NO TIME specified ("Buy milk") -> TASK (Internal List).
+    3. EXPLICIT ("Send to Telegram") -> notify_telegram = TRUE.
+    
+    OUTPUT JSON ONLY:
+    {{
+        "type": "task" | "event" | "note",
+        "module": "Subject or 'General'",
+        "title": "Title",
+        "details": "Details",
+        "date": "YYYY-MM-DD",
+        "time": "HH:MM",
+        "notify_telegram": boolean
+    }}
+    """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Context: {manual_module}. Input: {user_text}"}
+            ],
+            response_format={"type": "json_object"}
+        )
+        result = json.loads(response.choices[0].message.content)
+    except Exception as e: return {"error": str(e)}
+
+    # Force Reminders to Calendar
+    if "remind" in user_text.lower() and result.get("type") == "task":
+        result["type"] = "event"
+
+    # DB Save
+    item_type = result.get("type")
+    db_key = "events" if item_type == "event" else "tasks" if item_type == "task" else "knowledge"
+    target_mod = result.get("module", manual_module)
+    
+    if target_mod not in data["Modules"]: data["Modules"][target_mod] = {"tasks": [], "events": [], "knowledge": []}
+    if db_key not in data["Modules"][target_mod]: data["Modules"][target_mod][db_key] = []
+
+    item = {
+        "id": len(data["Modules"][target_mod][db_key]) + 1,
+        "title": result.get("title"),
+        "details": result.get("details"),
+        "date": result.get("date", get_current_date_str()),
+        "created_at": get_beijing_time_str()
+    }
+    if item_type == "event": item["time"] = result.get("time", "09:00")
+    data["Modules"][target_mod][db_key].append(item)
+    save_data(data)
+    
+    # External Actions
+    if item_type == "event":
+        iso = f"{result.get('date')}T{result.get('time','09:00')}:00"
+        success = add_google_calendar_event(result.get('title'), iso)
+        result["calendar_status"] = success
+
+    if result.get("notify_telegram") == True:
+        send_telegram_alert(f"📱 **Sent to Phone:**\n{result.get('title')}")
+        result["telegram_sent"] = True
+        
+    return result
+
+def chat_with_emily(user_message, history):
+    client = get_openai_client()
+    if not client: return "⚠️ API Key Missing."
+
+    check = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role":"system","content":"Is user asking to create a task/event? YES/NO"}, {"role":"user","content":user_message}]
+    )
+    if "YES" in check.choices[0].message.content.upper():
+        res = process_assistant_input(user_message)
+        if "error" in res: return f"❌ Error: {res['error']}"
+        
+        msg = "✅ **Done.**"
+        if res.get("type") == "event":
+            if res.get("calendar_status"): msg += f" Scheduled **{res.get('title')}** on Calendar."
+            else: msg += " (⚠️ Calendar Sync Failed)"
+        else: msg += f" Added **{res.get('title')}**."
+        
+        if res.get("telegram_sent"): msg += " 📲 Sent to Telegram."
+        return msg
+        
+    msgs = [{"role":"system","content":"You are Emily. Concise answers."}] + history + [{"role":"user","content":user_message}]
+    return client.chat.completions.create(model="gpt-4o", messages=msgs).choices[0].message.content
+
+# --- UI UTILS (Restored Logic) ---
+def delete_item(mod, type_, id_):
+    data = load_data()
+    if mod in data["Modules"] and type_ in data["Modules"][mod]:
+        data["Modules"][mod][type_] = [i for i in data["Modules"][mod][type_] if i.get("id") != id_]
+        save_data(data)
+
+def add_manual_item(mod, type_, title, details, date):
+    data = load_data()
+    if mod not in data["Modules"]: data["Modules"][mod] = {"tasks": [], "events": [], "knowledge": []}
+    if type_ not in data["Modules"][mod]: data["Modules"][mod][type_] = []
+    
+    new_id = len(data["Modules"][mod][type_]) + 1
+    item = {"id": new_id, "title": title, "details": details, "date": date}
+    data["Modules"][mod][type_].append(item)
+    save_data(data)
+
+def analyze_image(f, m="General"): return "Image Analysis Placeholder"
+def analyze_speech_coach(t): return {"grade": "B", "critique": "Good flow."}
