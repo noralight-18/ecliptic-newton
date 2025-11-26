@@ -10,7 +10,7 @@ from openai import OpenAI
 
 # --- CONFIGURATION ---
 DATA_FILE = "data.json"
-# We keep this as Shanghai (Beijing Time) as you requested
+# CHANGE THIS IF YOU ARE NOT IN CHINA
 USER_TIMEZONE = 'Asia/Shanghai' 
 BEIJING_TZ = pytz.timezone(USER_TIMEZONE)
 
@@ -32,8 +32,7 @@ def load_data():
 def save_data(data):
     with open(DATA_FILE, "w") as f: json.dump(data, f, indent=4)
 
-# --- TIME HELPERS (FIXED NAME HERE) ---
-def get_beijing_time_str():
+def get_current_time_str():
     return datetime.datetime.now(BEIJING_TZ).strftime("%H:%M")
 
 def get_current_date_str():
@@ -56,6 +55,9 @@ def add_google_calendar_event(summary, start_iso, duration_minutes=60):
     try:
         if "google" in st.secrets:
             creds_dict = dict(st.secrets["google"])
+            # Load the TARGET EMAIL (Your personal email)
+            target_calendar_id = creds_dict.get("calendar_email", "primary")
+            
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
             creds = service_account.Credentials.from_service_account_info(
                 creds_dict, scopes=['https://www.googleapis.com/auth/calendar']
@@ -71,11 +73,13 @@ def add_google_calendar_event(summary, start_iso, duration_minutes=60):
                 'end': {'dateTime': end_dt.isoformat(), 'timeZone': USER_TIMEZONE},
                 'reminders': {
                     'useDefault': False,
-                    'overrides': [{'method': 'popup', 'minutes': 0}], # Buzz EXACTLY at the time
+                    'overrides': [{'method': 'popup', 'minutes': 0}],
                 },
             }
-            service.events().insert(calendarId='primary', body=event).execute()
-            print(f"✅ Success: Added {summary} to Calendar")
+            
+            # HERE IS THE FIX: We use target_calendar_id instead of 'primary'
+            service.events().insert(calendarId=target_calendar_id, body=event).execute()
+            print(f"✅ Success: Added {summary} to {target_calendar_id}")
             return True
     except Exception as e:
         print(f"❌ Calendar Error: {e}")
@@ -120,11 +124,15 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
 
     data = load_data()
     
+    # SYSTEM PROMPT
+    # We added the "notify_telegram" field here
     system_prompt = f"""
     You are Emily. Current Time: {datetime.datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")}
+    
     LOGIC: 
-    - TIME specified ("at 2pm") -> EVENT (Calendar).
-    - NO Time specified ("Buy milk") -> TASK (Internal List).
+    1. If SPECIFIC TIME ("at 2pm") -> EVENT (Calendar).
+    2. If NO TIME ("Buy milk") -> TASK (Internal List).
+    3. If user explicitly says "Send to Telegram", "Tell me on phone", "Notify me" -> SET notify_telegram = TRUE.
     
     OUTPUT JSON ONLY:
     {{
@@ -133,7 +141,8 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
         "title": "Title",
         "details": "Details",
         "date": "YYYY-MM-DD",
-        "time": "HH:MM" (24h format. Default 09:00)
+        "time": "HH:MM" (Default 09:00),
+        "notify_telegram": boolean
     }}
     """
     
@@ -149,7 +158,7 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
         result = json.loads(response.choices[0].message.content)
     except Exception as e: return {"error": str(e)}
 
-    # FORCE REMINDERS TO CALENDAR
+    # Force Reminders to Calendar
     if "remind" in user_text.lower() and result.get("type") == "task":
         result["type"] = "event"
 
@@ -166,18 +175,26 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
         "title": result.get("title"),
         "details": result.get("details"),
         "date": result.get("date", get_current_date_str()),
-        "created_at": get_beijing_time_str()
+        "created_at": get_current_time_str()
     }
     if item_type == "event": item["time"] = result.get("time", "09:00")
         
     data["Modules"][target_mod][db_key].append(item)
     save_data(data)
     
-    # EXTERNAL ACTIONS
+    # --- EXTERNAL ACTIONS ---
+    
+    # 1. Google Calendar (Time-based)
     if item_type == "event":
         iso = f"{result.get('date')}T{result.get('time','09:00')}:00"
         success = add_google_calendar_event(result.get('title'), iso)
-        result["calendar_status"] = success # Pass status back
+        result["calendar_status"] = success
+
+    # 2. Telegram (Explicit Request)
+    # We ONLY send if user explicitly asked for it
+    if result.get("notify_telegram") == True:
+        send_telegram_alert(f"📱 **Sent to Phone:**\n{result.get('title')}\n{result.get('details')}")
+        result["telegram_sent"] = True
         
     return result
 
@@ -194,24 +211,20 @@ def chat_with_emily(user_message, history):
         res = process_assistant_input(user_message)
         if "error" in res: return f"❌ Error: {res['error']}"
         
+        response_msg = "✅ **Done.**"
         if res.get("type") == "event":
-            # CHECK CALENDAR STATUS
-            if res.get("calendar_status"):
-                return f"✅ **Scheduled!** I've added **{res.get('title')}** to your Google Calendar at {res.get('time')}."
-            else:
-                return f"⚠️ I saved **{res.get('title')}** to the app, but **Google Calendar sync failed**. Please check your Permissions/Secrets."
+            if res.get("calendar_status"): response_msg += f" Scheduled **{res.get('title')}** on Calendar."
+            else: response_msg += " (⚠️ Calendar Sync Failed - Check Email in Secrets)"
         else:
-            return f"✅ **Done.** Added **{res.get('title')}** to your tasks."
+            response_msg += f" Added **{res.get('title')}**."
+            
+        if res.get("telegram_sent"):
+            response_msg += " 📲 Sent to Telegram."
+            
+        return response_msg
         
-    # --- FIXED FALLBACK PERSONA ---
-    system_persona = """
-    You are Emily, a proactive Executive OS connected to the user's Google Calendar and Task Board.
-    
-    CAPABILITIES:
-    - You CAN schedule reminders (by adding them to Google Calendar).
-    - You CAN create tasks (by adding them to the app).
-    """
-    msgs = [{"role":"system","content":system_persona}] + history + [{"role":"user","content":user_message}]
+    # Standard Persona
+    msgs = [{"role":"system","content":"You are Emily. Concise answers."}] + history + [{"role":"user","content":user_message}]
     return client.chat.completions.create(model="gpt-4o", messages=msgs).choices[0].message.content
 
 # Mocks
