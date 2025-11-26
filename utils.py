@@ -10,7 +10,10 @@ from openai import OpenAI
 
 # --- CONFIGURATION ---
 DATA_FILE = "data.json"
-BEIJING_TZ = pytz.timezone('Asia/Shanghai')
+# ⚠️ IMPORTANT: Change this to your actual Timezone (e.g., 'America/New_York', 'Europe/Paris')
+# If this is wrong, your reminders will be at the wrong time!
+USER_TIMEZONE = 'Asia/Shanghai' 
+BEIJING_TZ = pytz.timezone(USER_TIMEZONE)
 
 def get_openai_client():
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -22,24 +25,23 @@ def get_openai_client():
 
 # --- DATABASE HELPERS ---
 def load_data():
-    if not os.path.exists(DATA_FILE): return {"Modules": {}}
+    if not os.path.exists(DATA_FILE): return {"Modules": {}, "Meta": {"last_briefing": ""}}
     with open(DATA_FILE, "r") as f:
         try: return json.load(f)
-        except: return {"Modules": {}}
+        except: return {"Modules": {}, "Meta": {"last_briefing": ""}}
 
 def save_data(data):
     with open(DATA_FILE, "w") as f: json.dump(data, f, indent=4)
 
-def get_beijing_time_str():
+def get_current_time_str():
     return datetime.datetime.now(BEIJING_TZ).strftime("%H:%M")
 
 def get_current_date_str():
     return datetime.datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
 
-# --- INTELLIGENT NOTIFICATIONS ---
+# --- NOTIFICATION SYSTEMS ---
 
 def send_telegram_alert(message):
-    """Sends an IMMEDIATE message to Telegram."""
     try:
         if "telegram" in st.secrets:
             token = st.secrets["telegram"]["bot_token"]
@@ -50,8 +52,7 @@ def send_telegram_alert(message):
     except Exception as e:
         print(f"Telegram Failed: {e}")
 
-def add_google_calendar_event(summary, start_iso, duration_minutes=30):
-    """Adds event to Google Calendar (This works as the Reminder)"""
+def add_google_calendar_event(summary, start_iso, duration_minutes=60):
     try:
         if "google" in st.secrets:
             creds_dict = dict(st.secrets["google"])
@@ -61,24 +62,50 @@ def add_google_calendar_event(summary, start_iso, duration_minutes=30):
             )
             service = build('calendar', 'v3', credentials=creds)
             
-            # Create Time Objects
             start_dt = datetime.datetime.fromisoformat(start_iso)
             end_dt = start_dt + datetime.timedelta(minutes=duration_minutes)
             
             event = {
-                'summary': f"⏰ {summary}",  # Add Alarm Clock Emoji
-                'start': {'dateTime': start_dt.isoformat(), 'timeZone': 'Asia/Shanghai'},
-                'end': {'dateTime': end_dt.isoformat(), 'timeZone': 'Asia/Shanghai'},
+                'summary': f"⏰ {summary}", 
+                'start': {'dateTime': start_dt.isoformat(), 'timeZone': USER_TIMEZONE},
+                'end': {'dateTime': end_dt.isoformat(), 'timeZone': USER_TIMEZONE},
                 'reminders': {
                     'useDefault': False,
-                    'overrides': [
-                        {'method': 'popup', 'minutes': 0}, # Notify at exact time
-                    ],
+                    'overrides': [{'method': 'popup', 'minutes': 0}], # Buzz EXACTLY at the time
                 },
             }
             service.events().insert(calendarId='primary', body=event).execute()
+            print(f"✅ Success: Added {summary} to Calendar")
             return True
-    except: return False
+    except Exception as e:
+        print(f"❌ Calendar Error: {e}")
+        return False
+
+# --- MORNING BRIEFING ---
+def check_and_send_briefing():
+    data = load_data()
+    today_str = get_current_date_str()
+    last_sent = data.get("Meta", {}).get("last_briefing", "")
+    
+    if last_sent != today_str:
+        todays_tasks = []
+        todays_events = []
+        
+        for mod, content in data.get("Modules", {}).items():
+            for t in content.get("tasks", []):
+                if t.get("date") == today_str: todays_tasks.append(f"• {t['title']}")
+            for e in content.get("events", []):
+                if e.get("date") == today_str: todays_events.append(f"• {e.get('time','?')}: {e['title']}")
+        
+        if todays_tasks or todays_events:
+            msg = f"🌅 **Morning Briefing** ({today_str})\n\n"
+            msg += f"📅 **Events:**\n" + ("\n".join(todays_events) if todays_events else "None") + "\n\n"
+            msg += f"✅ **Tasks:**\n" + ("\n".join(todays_tasks) if todays_tasks else "None")
+            send_telegram_alert(msg)
+            
+            if "Meta" not in data: data["Meta"] = {}
+            data["Meta"]["last_briefing"] = today_str
+            save_data(data)
 
 # --- THE BRAIN ---
 
@@ -92,27 +119,21 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
     if not client: return {"error": "API Key Missing"}
 
     data = load_data()
-    current_time_str = datetime.datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
     
-    # SYSTEM PROMPT: Simpler Logic
     system_prompt = f"""
-    You are Emily, an intelligent Executive OS.
-    Current System Time (Beijing): {current_time_str}
+    You are Emily. Current Time: {datetime.datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")}
+    LOGIC: 
+    - TIME specified ("at 2pm") -> EVENT (Calendar).
+    - NO Time specified ("Buy milk") -> TASK (Internal List).
     
-    YOUR GOAL: Classify input.
-    
-    CRITICAL RULE: 
-    - If the user specifies a TIME (e.g. "at 10pm", "in 1 hour"), it MUST be an EVENT/REMINDER (Calendar).
-    - If the user specifies NO TIME (e.g. "Buy milk"), it is a TASK (Telegram).
-
     OUTPUT JSON ONLY:
     {{
         "type": "task" | "event" | "note",
         "module": "Subject or 'General'",
-        "title": "Short title",
-        "details": "Full context",
+        "title": "Title",
+        "details": "Details",
         "date": "YYYY-MM-DD",
-        "time": "HH:MM" (24h format. If user says '10pm', output '22:00'. If user says 'in 1 hour' and now is 14:00, output '15:00'.)
+        "time": "HH:MM" (24h format. Default 09:00)
     }}
     """
     
@@ -126,13 +147,14 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
             response_format={"type": "json_object"}
         )
         result = json.loads(response.choices[0].message.content)
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception as e: return {"error": str(e)}
 
-    # Logic: Reminders are now treated as Events so they go to Calendar
+    # FORCE REMINDERS TO CALENDAR
+    if "remind" in user_text.lower() and result.get("type") == "task":
+        result["type"] = "event"
+
+    # Save
     item_type = result.get("type")
-    
-    # Save to Database
     db_key = "events" if item_type == "event" else "tasks" if item_type == "task" else "knowledge"
     target_mod = result.get("module", manual_module)
     
@@ -141,30 +163,21 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
 
     item = {
         "id": len(data["Modules"][target_mod][db_key]) + 1,
-        "title": result.get("title", "Untitled"),
-        "details": result.get("details", ""),
+        "title": result.get("title"),
+        "details": result.get("details"),
         "date": result.get("date", get_current_date_str()),
-        "created_at": get_beijing_time_str()
+        "created_at": get_current_time_str()
     }
-    if item_type == "event":
-        item["time"] = result.get("time", "09:00")
+    if item_type == "event": item["time"] = result.get("time", "09:00")
         
     data["Modules"][target_mod][db_key].append(item)
     save_data(data)
     
-    # --- ROUTING LOGIC ---
-    
-    # 1. TIME-BASED (Calendar)
+    # EXTERNAL ACTIONS
     if item_type == "event":
         iso = f"{result.get('date')}T{result.get('time','09:00')}:00"
         success = add_google_calendar_event(result.get('title'), iso)
-        if success:
-            # We send a Telegram just to confirm we did it, but the REMINDER is in the Calendar
-            send_telegram_alert(f"🗓️ *Scheduled*\n\nI've added **{result.get('title')}** to your Calendar for {result.get('time')}.")
-            
-    # 2. IMMEDIATE (Telegram)
-    elif item_type == "task":
-        send_telegram_alert(f"⚡ *New Task*\n\n{result.get('title')}\nDue: {result.get('date')}")
+        result["calendar_status"] = success # Pass status back
         
     return result
 
@@ -182,11 +195,29 @@ def chat_with_emily(user_message, history):
         if "error" in res: return f"❌ Error: {res['error']}"
         
         if res.get("type") == "event":
-            return f"✅ Done. I've scheduled **{res.get('title')}** on your Google Calendar at {res.get('time')}."
+            # CHECK CALENDAR STATUS
+            if res.get("calendar_status"):
+                return f"✅ **Scheduled!** I've added **{res.get('title')}** to your Google Calendar at {res.get('time')}."
+            else:
+                return f"⚠️ I saved **{res.get('title')}** to the app, but **Google Calendar sync failed**. Please check your Permissions/Secrets."
         else:
-            return f"✅ Done. Added **{res.get('title')}** to your tasks."
+            return f"✅ **Done.** Added **{res.get('title')}** to your tasks."
         
-    msgs = [{"role":"system","content":"You are Emily. Concise answers."}] + history + [{"role":"user","content":user_message}]
+    # --- FIXED FALLBACK PERSONA ---
+    # Now she knows she has tools!
+    system_persona = """
+    You are Emily, a proactive Executive OS connected to the user's Google Calendar and Task Board.
+    
+    CAPABILITIES:
+    - You CAN schedule reminders (by adding them to Google Calendar).
+    - You CAN create tasks (by adding them to the app).
+    
+    IF THE USER COMPLAINS about not getting a reminder:
+    1. Explain that you push reminders to their Google Calendar.
+    2. Ask them to check if their "Google Calendar Notifications" are turned on.
+    3. Remind them to check the Timezone setting in the code if the time was wrong.
+    """
+    msgs = [{"role":"system","content":system_persona}] + history + [{"role":"user","content":user_message}]
     return client.chat.completions.create(model="gpt-4o", messages=msgs).choices[0].message.content
 
 # Mocks
