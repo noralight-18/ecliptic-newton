@@ -4,11 +4,12 @@ import os
 import datetime
 import pytz
 import requests
+import base64
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from openai import OpenAI
 
-# --- CONFIGURATION ---
+# --- 1. CONFIGURATION ---
 DATA_FILE = "data.json"
 USER_TIMEZONE = 'Asia/Shanghai' 
 BEIJING_TZ = pytz.timezone(USER_TIMEZONE)
@@ -21,7 +22,7 @@ def get_openai_client():
         return OpenAI(api_key=api_key)
     return None
 
-# --- DATABASE HELPERS ---
+# --- 2. DATABASE HELPERS ---
 def load_data():
     if not os.path.exists(DATA_FILE): 
         return {"Modules": {}, "Meta": {"last_briefing": ""}}
@@ -40,7 +41,7 @@ def get_current_date_str():
 
 def get_current_context():
     h = datetime.datetime.now(BEIJING_TZ).hour
-    if 9 <= h < 18: return "Working"
+    if 9 <= h < 18: return "Working / Studying"
     return "Free Time"
 
 def get_all_classes():
@@ -49,7 +50,8 @@ def get_all_classes():
 def get_current_module():
     return "General"
 
-# --- NOTIFICATIONS ---
+# --- 3. NOTIFICATION SYSTEMS ---
+
 def send_telegram_alert(message):
     try:
         if "telegram" in st.secrets:
@@ -59,13 +61,14 @@ def send_telegram_alert(message):
             payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
             requests.post(url, json=payload)
     except Exception as e:
-        print(f"Telegram Error: {e}")
+        print(f"Telegram Failed: {e}")
 
 def add_google_calendar_event(summary, start_iso, duration_minutes=60):
     try:
         if "google" in st.secrets:
             creds_dict = dict(st.secrets["google"])
-            # Target the email in secrets, or default to the robot's calendar
+            
+            # Use 'calendar_email' from secrets to target YOUR calendar
             target_id = creds_dict.get("calendar_email", "primary")
             
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
@@ -81,58 +84,108 @@ def add_google_calendar_event(summary, start_iso, duration_minutes=60):
                 'summary': f"⏰ {summary}", 
                 'start': {'dateTime': start_dt.isoformat(), 'timeZone': USER_TIMEZONE},
                 'end': {'dateTime': end_dt.isoformat(), 'timeZone': USER_TIMEZONE},
-                'reminders': {'useDefault': False, 'overrides': [{'method': 'popup', 'minutes': 0}]}
+                'reminders': {'useDefault': False, 'overrides': [{'method': 'popup', 'minutes': 0}]},
             }
+            
             service.events().insert(calendarId=target_id, body=event).execute()
+            print(f"✅ Success: Added {summary} to {target_id}")
             return True
     except Exception as e:
-        print(f"Calendar Error: {e}")
+        print(f"❌ Calendar Error: {e}")
         return False
 
-# --- MORNING BRIEFING ---
+# --- 4. MORNING BRIEFING ---
 def check_and_send_briefing():
     data = load_data()
     today_str = get_current_date_str()
     last_sent = data.get("Meta", {}).get("last_briefing", "")
     
     if last_sent != today_str:
-        tasks = []
-        events = []
+        todays_tasks = []
+        todays_events = []
+        
         for mod, content in data.get("Modules", {}).items():
             for t in content.get("tasks", []):
-                if t.get("date") == today_str: tasks.append(f"• {t['title']}")
+                if t.get("date") == today_str: todays_tasks.append(f"• {t['title']}")
             for e in content.get("events", []):
-                if e.get("date") == today_str: events.append(f"• {e.get('time','?')}: {e['title']}")
+                if e.get("date") == today_str: todays_events.append(f"• {e.get('time','?')}: {e['title']}")
         
-        if tasks or events:
-            msg = f"🌅 **Briefing** ({today_str})\n\n📅 **Events:**\n"
-            msg += "\n".join(events) if events else "None"
-            msg += "\n\n✅ **Tasks:**\n"
-            msg += "\n".join(tasks) if tasks else "None"
-            
+        if todays_tasks or todays_events:
+            msg = f"🌅 **Morning Briefing** ({today_str})\n\n"
+            msg += f"📅 **Events:**\n" + ("\n".join(todays_events) if todays_events else "None") + "\n\n"
+            msg += f"✅ **Tasks:**\n" + ("\n".join(todays_tasks) if todays_tasks else "None")
             send_telegram_alert(msg)
             
             if "Meta" not in data: data["Meta"] = {}
             data["Meta"]["last_briefing"] = today_str
             save_data(data)
 
-# --- AI BRAIN ---
+# --- 5. THE AI BRAIN (Vision + Voice + Chat) ---
+
 def transcribe_audio(audio_file, for_coach=False):
     client = get_openai_client()
     if not client: return "⚠️ API Key Missing"
     return client.audio.transcriptions.create(model="whisper-1", file=audio_file, response_format="text")
 
+def analyze_image(image_file, manual_module="General"):
+    """
+    Real Vision Implementation. Fixes the TypeError.
+    """
+    client = get_openai_client()
+    if not client: return "⚠️ API Key Missing"
+
+    try:
+        # Encode image to Base64
+        base64_image = base64.b64encode(image_file.getvalue()).decode('utf-8')
+
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Analyze this image. If it's a document, transcribe key details. If it's a scene, describe it relevant to my work. Keep it concise."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                    ],
+                }
+            ],
+            max_tokens=800
+        )
+        
+        analysis = response.choices[0].message.content
+        
+        # Save to DB
+        data = load_data()
+        if manual_module not in data["Modules"]: data["Modules"][manual_module] = {"tasks":[], "events":[], "knowledge":[]}
+        if "knowledge" not in data["Modules"][manual_module]: data["Modules"][manual_module]["knowledge"] = []
+        
+        item = {
+            "id": len(data["Modules"][manual_module]["knowledge"]) + 1,
+            "title": "📷 Scan",
+            "details": analysis,
+            "date": get_current_date_str(),
+            "created_at": get_beijing_time_str()
+        }
+        data["Modules"][manual_module]["knowledge"].append(item)
+        save_data(data)
+        
+        return analysis
+
+    except Exception as e:
+        return f"Error analyzing image: {str(e)}"
+
 def process_assistant_input(user_text, manual_module="General", last_task_metadata=None):
     client = get_openai_client()
     if not client: return {"error": "API Key Missing"}
+
     data = load_data()
     
-    # We use double braces {{ }} to escape them in f-strings
     system_prompt = f"""
     You are Emily. Current Time: {datetime.datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")}
-    LOGIC:
-    1. TIME specified ("at 2pm") -> EVENT (Calendar).
-    2. NO TIME specified ("Buy milk") -> TASK (Internal List).
+    
+    LOGIC: 
+    1. SPECIFIC TIME ("at 2pm") -> EVENT (Calendar).
+    2. NO TIME ("Buy milk") -> TASK (Internal List).
     3. EXPLICIT ("Send to Telegram") -> notify_telegram = TRUE.
     
     OUTPUT JSON ONLY:
@@ -146,6 +199,7 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
         "notify_telegram": boolean
     }}
     """
+    
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
@@ -162,7 +216,7 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
     if "remind" in user_text.lower() and result.get("type") == "task":
         result["type"] = "event"
 
-    # DB Save
+    # Save
     item_type = result.get("type")
     db_key = "events" if item_type == "event" else "tasks" if item_type == "task" else "knowledge"
     target_mod = result.get("module", manual_module)
@@ -178,6 +232,7 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
         "created_at": get_beijing_time_str()
     }
     if item_type == "event": item["time"] = result.get("time", "09:00")
+        
     data["Modules"][target_mod][db_key].append(item)
     save_data(data)
     
@@ -188,7 +243,7 @@ def process_assistant_input(user_text, manual_module="General", last_task_metada
         result["calendar_status"] = success
 
     if result.get("notify_telegram") == True:
-        send_telegram_alert(f"📱 **Sent to Phone:**\n{result.get('title')}")
+        send_telegram_alert(f"📱 **Sent to Phone:**\n{result.get('title')}\n{result.get('details')}")
         result["telegram_sent"] = True
         
     return result
@@ -201,23 +256,28 @@ def chat_with_emily(user_message, history):
         model="gpt-4o",
         messages=[{"role":"system","content":"Is user asking to create a task/event? YES/NO"}, {"role":"user","content":user_message}]
     )
+    
     if "YES" in check.choices[0].message.content.upper():
         res = process_assistant_input(user_message)
         if "error" in res: return f"❌ Error: {res['error']}"
         
-        msg = "✅ **Done.**"
+        response_msg = "✅ **Done.**"
         if res.get("type") == "event":
-            if res.get("calendar_status"): msg += f" Scheduled **{res.get('title')}** on Calendar."
-            else: msg += " (⚠️ Calendar Sync Failed)"
-        else: msg += f" Added **{res.get('title')}**."
-        
-        if res.get("telegram_sent"): msg += " 📲 Sent to Telegram."
-        return msg
+            if res.get("calendar_status"): response_msg += f" Scheduled **{res.get('title')}** on Calendar."
+            else: response_msg += " (⚠️ Calendar Sync Failed - Check Secrets)"
+        else:
+            response_msg += f" Added **{res.get('title')}**."
+            
+        if res.get("telegram_sent"):
+            response_msg += " 📲 Sent to Telegram."
+            
+        return response_msg
         
     msgs = [{"role":"system","content":"You are Emily. Concise answers."}] + history + [{"role":"user","content":user_message}]
     return client.chat.completions.create(model="gpt-4o", messages=msgs).choices[0].message.content
 
-# --- UI UTILS (Restored Logic) ---
+# --- 6. UI HELPERS (Required for Buttons) ---
+
 def delete_item(mod, type_, id_):
     data = load_data()
     if mod in data["Modules"] and type_ in data["Modules"][mod]:
@@ -234,5 +294,17 @@ def add_manual_item(mod, type_, title, details, date):
     data["Modules"][mod][type_].append(item)
     save_data(data)
 
-def analyze_image(f, m="General"): return "Image Analysis Placeholder"
-def analyze_speech_coach(t): return {"grade": "B", "critique": "Good flow."}
+def analyze_speech_coach(transcript):
+    client = get_openai_client()
+    if not client: return {"grade": "N/A", "critique": "API Key Missing"}
+    
+    # Simple Coach Logic
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o", 
+            messages=[{"role": "user", "content": f"Analyze speech. Grade (A-F), score pacing (1-10), count fillers. JSON. Text: {transcript}"}],
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.choices[0].message.content)
+    except:
+        return {"grade": "N/A", "pacing_score": 0, "filler_count": 0, "critique": "Error analyzing."}
