@@ -196,4 +196,122 @@ elif view == "📅 Calendar":
                         st.markdown(f"""
                         <div class="event-card">
                             <b>{event['title']}</b><br>
-                            <span style="fon
+                            <span style="font-size:0.8em;">{event.get('time', '')}</span><br>
+                            <span style="font-size:0.7em; color:#ccc">{mod}</span>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        events_found = True
+            
+            if not events_found:
+                st.markdown('<div style="opacity:0.3; padding:10px;">Empty</div>', unsafe_allow_html=True)
+
+elif view == "✅ Tasks":
+    st.header("✅ Task Board")
+    
+    # Manual Entry
+    with st.expander("➕ Add Task Manually"):
+        with st.form("manual_task"):
+            c1, c2 = st.columns(2)
+            t_title = c1.text_input("Title")
+            t_date = c2.date_input("Due Date")
+            t_details = st.text_area("Details")
+            
+            schedule_classes = utils.get_all_classes()
+            all_options = sorted(list(set(schedule_classes + list(modules.keys()))))
+            t_module = st.selectbox("Module", ["General"] + all_options)
+            
+            if st.form_submit_button("Save Task"):
+                utils.add_manual_item(t_module, "tasks", t_title, t_details, str(t_date))
+                st.success("Task Saved")
+                st.rerun()
+    
+    if not modules:
+        st.info("No active modules.")
+    else:
+        # Kanban Columns
+        mod_names = list(modules.keys())
+        cols = st.columns(len(mod_names)) if len(mod_names) > 0 else [st.container()]
+        
+        for idx, mod_name in enumerate(mod_names):
+            content = modules[mod_name]
+            with cols[idx]:
+                st.subheader(mod_name)
+                for task in content.get("tasks", []):
+                    if isinstance(task, dict):
+                        st.warning(f"**{task['title']}**\n\n{task.get('date', '')}")
+                    else:
+                        st.warning(f"☐ {task}")
+
+elif view == "🧠 Knowledge":
+    st.header("🧠 Knowledge Base")
+    
+    for mod_name, content in modules.items():
+        with st.expander(f"📂 {mod_name}", expanded=False):
+            knowledge_items = content.get("knowledge", [])
+            
+            if knowledge_items:
+                for item in knowledge_items:
+                    st.markdown(f"#### {item.get('title', 'Note')}")
+                    st.caption(item.get('date', ''))
+                    st.write(item.get('details', ''))
+                    st.divider()
+            else:
+                st.caption("No notes.")
+
+elif view == "🗣️ Coach":
+    st.header("🗣️ Presentation Coach")
+    
+    audio_coach = st.audio_input("Practice Speech")
+    
+    if audio_coach:
+        with st.spinner("Analyzing..."):
+            transcript = utils.transcribe_audio(audio_coach, for_coach=True)
+            st.markdown(f"**Transcript:** {transcript}")
+            stats = utils.analyze_speech_coach(transcript)
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Grade", stats.get("grade", "N/A"))
+            c2.metric("Pacing", f"{stats.get('pacing_score', 0)}/10")
+            c3.metric("Fillers", stats.get("filler_count", 0))
+            
+            st.info(f"Critique: {stats.get('critique', '')}")
+
+# --- OMNISCIENT CHAT ---
+st.divider()
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# Chat Input & Vision Upload
+col_chat_input, col_chat_upload = st.columns([0.85, 0.15])
+
+with col_chat_input:
+    prompt = st.chat_input("Ask Andy...")
+
+with col_chat_upload:
+    uploaded_file = st.file_uploader("📷", type=["jpg", "png", "jpeg"], label_visibility="collapsed")
+
+if prompt:
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+        
+    with st.spinner("Working..."):
+        history = [m for m in st.session_state.messages if m["role"] != "system"]
+        response = utils.chat_with_emily(prompt, history)
+        
+    st.session_state.messages.append({"role": "assistant", "content": response})
+    with st.chat_message("assistant"):
+        st.markdown(response)
+        if "✅" in response: # If action taken, refresh UI
+            st.rerun()
+
+if uploaded_file:
+    with st.spinner("Transcribing..."):
+        note = utils.analyze_image(uploaded_file, manual_module="General")
+        st.session_state.messages.append({"role": "user", "content": "[Uploaded Document]"})
+        st.session_state.messages.append({"role": "assistant", "content": f"✅ I've transcribed that document into your Knowledge Base.\n\n**Preview:**\n{note[:200]}..."})
+        st.rerun()
