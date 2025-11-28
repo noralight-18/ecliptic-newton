@@ -155,30 +155,45 @@ def send_telegram_alert(message):
 def check_and_send_briefing():
     data = load_data()
     today_str = get_current_date_str()
-    last_sent = data.get("Meta", {}).get("last_briefing", "")
     
+    # Ensure Meta exists
+    if "Meta" not in data: 
+        data["Meta"] = {"last_briefing": ""}
+    
+    last_sent = data["Meta"].get("last_briefing", "")
+    
+    # Only run if we haven't sent it today
     if last_sent != today_str:
         todays_tasks = []
         todays_events = []
         overdue_tasks = []
         
         for mod, content in data.get("Modules", {}).items():
+            # Tasks
             for t in content.get("tasks", []):
                 if t.get("date") == today_str: todays_tasks.append(f"• {t['title']}")
                 elif t.get("date") < today_str: overdue_tasks.append(f"• {t['title']}")
+            # Events
             for e in content.get("events", []):
-                if e.get("date") == today_str: todays_events.append(f"• {e.get('time','?')}: {e['title']}")
+                if e.get("date") == today_str:
+                    todays_events.append(f"• {e.get('time','?')}: {e['title']}")
         
-        if todays_tasks or todays_events or overdue_tasks:
-            msg = f"☕ **Morning Briefing**\n\n"
-            if todays_events: msg += f"📅 **Schedule:**\n" + "\n".join(todays_events) + "\n\n"
-            else: msg += "📅 Schedule is clear.\n\n"
-            if todays_tasks: msg += f"✅ **To-Do:**\n" + "\n".join(todays_tasks) + "\n\n"
-            if overdue_tasks: msg += f"\n🛑 **Outstanding:**\n" + "\n".join(overdue_tasks)
+        # Build Message
+        msg = f"☕ **Morning Briefing** ({today_str})\n\n"
+        
+        if todays_events: msg += f"📅 **Schedule:**\n" + "\n".join(todays_events) + "\n\n"
+        else: msg += "📅 Schedule is clear.\n\n"
+        
+        if todays_tasks: msg += f"✅ **To-Do:**\n" + "\n".join(todays_tasks) + "\n\n"
+        else: msg += "✅ No deadlines today.\n\n"
+        
+        if overdue_tasks:
+            msg += f"\n🛑 **Outstanding:**\n" + "\n".join(overdue_tasks)
             
-            send_telegram_alert(msg)
+        # Send Alert
+        send_telegram_alert(msg)
             
-        if "Meta" not in data: data["Meta"] = {}
+        # CRITICAL: Save that we sent it so it doesn't send again
         data["Meta"]["last_briefing"] = today_str
         save_data(data)
 
@@ -223,32 +238,29 @@ def analyze_image(image_file, manual_module="General"):
         save_data(data)
         return analysis
     except Exception as e: return f"Error: {str(e)}"
-
-def process_assistant_input(user_text, manual_module="General"):
+def process_assistant_input(user_text, manual_module="General", last_task_metadata=None):
     client = get_openai_client()
     if not client: return {"error": "API Key Missing"}
     data = load_data()
     
+    # --- UPDATED PROMPT: STRICT 'COMMAND' SEPARATION ---
     system_prompt = f"""
-    You are Andy (Emily). Current Time: {datetime.datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")}
+    You are Andy. Current Time: {datetime.datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")}
     
-    JOB: Route information.
+    1. CLASSIFY INTENT (CRITICAL):
+       - EXECUTE/REPORT ("Send me a list", "What are my tasks?", "Send morning brief", "Send reminder now") -> COMMAND (Do NOT save to DB).
+       - CREATE/SAVE ("Add task", "Buy milk", "Schedule meeting") -> TASK or EVENT (Save to DB).
+       - INFORMATIONAL ("Notes", "Remember that", "The formula is...") -> NOTE (Save to DB).
     
-    1. INTENT:
-       - ACTIONABLE (Meeting, Call, Deadline) -> TASK or EVENT.
-       - INFORMATIONAL (Notes) -> NOTE.
-    
-    2. SMART REMINDERS:
-       - TRAVEL/PHYSICAL -> 60 mins.
-       - VIRTUAL -> 15 mins.
-       - CALL -> 2 mins.
-       - EXAM -> 120 mins.
+    2. REMINDERS:
+       - TRAVEL -> 60m. VIRTUAL -> 15m. CALL -> 2m. EXAM -> 120m.
        
-    3. EXPLICIT TELEGRAM -> notify_telegram = TRUE.
+    3. TELEGRAM:
+       - If user says "Send to phone" OR type is COMMAND -> notify_telegram = TRUE.
 
     OUTPUT JSON:
     {{
-        "type": "task" | "event" | "note",
+        "type": "task" | "event" | "note" | "command",
         "module": "Subject or 'General'",
         "title": "Title",
         "details": "Details",
@@ -272,36 +284,41 @@ def process_assistant_input(user_text, manual_module="General"):
     if "remind" in user_text.lower() and result.get("type") == "task":
         result["type"] = "event"
 
-    # Save
-    item_type = result.get("type")
-    db_key = "events" if item_type == "event" else "knowledge" if item_type == "note" else "tasks"
-    target_mod = result.get("module", manual_module)
-    
-    if target_mod not in data["Modules"]: data["Modules"][target_mod] = {"tasks": [], "events": [], "knowledge": []}
-    if db_key not in data["Modules"][target_mod]: data["Modules"][target_mod][db_key] = []
-
-    item = {
-        "id": len(data["Modules"][target_mod][db_key]) + 1,
-        "title": result.get("title"),
-        "details": result.get("details"),
-        "date": result.get("date", get_current_date_str()),
-        "created_at": get_beijing_time_str()
-    }
-    if item_type == "event": item["time"] = result.get("time", "09:00")
+    # --- SAVE LOGIC (ONLY IF NOT A COMMAND) ---
+    # This prevents her from saving "Send me a reminder" as a note
+    if result.get("type") != "command":
+        item_type = result.get("type")
+        db_key = "events" if item_type == "event" else "knowledge" if item_type == "note" else "tasks"
+        target_mod = result.get("module", manual_module)
         
-    data["Modules"][target_mod][db_key].append(item)
-    save_data(data)
+        if target_mod not in data["Modules"]: data["Modules"][target_mod] = {"tasks": [], "events": [], "knowledge": []}
+        if db_key not in data["Modules"][target_mod]: data["Modules"][target_mod][db_key] = []
+
+        item = {
+            "id": len(data["Modules"][target_mod][db_key]) + 1,
+            "title": result.get("title"),
+            "details": result.get("details"),
+            "date": result.get("date", get_current_date_str()),
+            "created_at": get_beijing_time_str()
+        }
+        if item_type == "event": item["time"] = result.get("time", "09:00")
+            
+        data["Modules"][target_mod][db_key].append(item)
+        save_data(data)
     
-    # Actions
-    if item_type == "event":
+    # --- ACTIONS ---
+    if result.get("type") == "event":
         iso = f"{result.get('date')}T{result.get('time','09:00')}:00"
         buffer = result.get("reminder_minutes", 10)
         success = add_google_calendar_event(result.get('title'), iso, reminder_minutes=buffer)
         result["calendar_status"] = success
         result["buffer"] = buffer
 
-    if result.get("notify_telegram") == True:
-        send_telegram_alert(f"📱 **Instant Alert:**\n{result.get('title')}")
+    # Send Telegram if explicit request OR if it is a Command
+    if result.get("notify_telegram") == True or result.get("type") == "command":
+        # If command, send details. If item, send title.
+        txt = result.get("details") if result.get("type") == "command" else result.get("title")
+        send_telegram_alert(f"📱 **Andy:**\n{txt}")
         result["telegram_sent"] = True
         
     return result
@@ -382,8 +399,18 @@ def chat_with_emily(user_message, history):
 def delete_item(mod, type_, id_):
     data = load_data()
     if mod in data["Modules"] and type_ in data["Modules"][mod]:
-        data["Modules"][mod][type_] = [i for i in data["Modules"][mod][type_] if i.get("id") != id_]
-        save_data(data)
+        # Filter out the item with the matching ID
+        original_len = len(data["Modules"][mod][type_])
+        
+        # Keep items that DO NOT match the ID
+        data["Modules"][mod][type_] = [
+            i for i in data["Modules"][mod][type_] 
+            if str(i.get("id")) != str(id_)
+        ]
+        
+        # Save only if something actually changed
+        if len(data["Modules"][mod][type_]) < original_len:
+            save_data(data)
 
 def add_manual_item(mod, type_, title, details, date):
     data = load_data()
